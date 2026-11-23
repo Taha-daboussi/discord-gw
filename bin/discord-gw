@@ -1,0 +1,1195 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["websockets>=14,<17"]
+# ///
+import argparse
+import asyncio
+import base64
+import fcntl
+import json
+import os
+import random
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zlib
+from datetime import datetime, timezone
+from pathlib import Path
+
+HOME = Path.home()
+CONF_DIR = Path(os.environ.get("DISCORD_GW_CONF", HOME / ".config/discord-gw"))
+STATE_DIR = Path(os.environ.get("DISCORD_GW_STATE", HOME / ".local/state/discord-gw"))
+AUTH = CONF_DIR / "auth.json"
+CONFIG = CONF_DIR / "config.json"
+DB = STATE_DIR / "discord.db"
+LOCK = STATE_DIR / "daemon.lock"
+MEDIA = STATE_DIR / "media"
+MEDIA_HOSTS = ("cdn.discordapp.com", "media.discordapp.net")
+MEDIA_PARALLEL = 3
+SERVICE = "discord-gw.service"
+API = "https://discord.com/api/v9"
+GATEWAY_QUERY = "/?encoding=json&v=9&compress=zlib-stream"
+GATEWAY = "wss://gateway.discord.gg" + GATEWAY_QUERY
+DEFAULT_CHANNELS = {}
+ALLOWED_OPS = {1: "heartbeat", 2: "identify", 6: "resume"}
+EXIT_AUTH = 3
+EXIT_TIMEOUT = 5
+EXIT_DOWN = 4
+ALIVE_SECS = 150
+
+USAGE = """\
+Read-only Discord gateway listener for the agents' team questions.
+One shared daemon (systemd user service discord-gw) records the chats in a local SQLite store.
+It never sends a message, never reacts, never marks a chat read, and never changes the status.
+
+  discord-gw status                          listener state and the recorded chats
+  discord-gw read  [--since-msg ID | --last N | --around ID] [--channel C] [--json]
+  discord-gw wait  (--since-msg ID | --cursor N) [--timeout 60m] [--batch 30s] [--others] [--channel C] [--json]
+  discord-gw thread MSG_ID [--channel C]     a message, every reply to it, and the reactions
+  discord-gw media MSG_ID                    the local files of the attachments of one message
+  discord-gw login                           take a fresh token from the logged-in browser
+  discord-gw daemon                          the listener itself (systemd runs it)
+
+The chats and the default chat come from config.json (channels, default_channel). C is a chat id or a part of its name.
+wait exits 0 with new events, 5 at the timeout, 4 when the listener is down.
+The listener saves every attachment in media/<chat id>/<message id>/<filename> next to the store;
+read, wait and thread show that local path on the 📎 line. Discord links expire after about a day.
+"""
+
+
+class AuthError(Exception):
+    pass
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def log(msg):
+    print(f"{datetime.now().strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def parse_duration(text):
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([smh]?)", text.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad duration {text!r}; use 30s, 10m or 2h")
+    return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600}[m.group(2)]
+
+
+def load_channels():
+    if CONFIG.exists():
+        return {int(k): v for k, v in json.loads(CONFIG.read_text()).get("channels", {}).items()}
+    return {int(k): v for k, v in DEFAULT_CHANNELS.items()}
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT, global_name TEXT);
+CREATE TABLE IF NOT EXISTS channels (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY, channel_id INTEGER NOT NULL, author_id INTEGER, type INTEGER,
+  content TEXT, created_at TEXT, edited_at TEXT, reply_to INTEGER, extras TEXT,
+  deleted INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS messages_channel ON messages(channel_id, id);
+CREATE INDEX IF NOT EXISTS messages_reply ON messages(reply_to);
+CREATE TABLE IF NOT EXISTS reactions (
+  message_id INTEGER NOT NULL, emoji TEXT NOT NULL, user_id INTEGER NOT NULL, at TEXT,
+  PRIMARY KEY (message_id, emoji, user_id));
+CREATE TABLE IF NOT EXISTS events (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, channel_id INTEGER NOT NULL,
+  message_id INTEGER NOT NULL, kind TEXT NOT NULL, user_id INTEGER, emoji TEXT, source TEXT);
+CREATE INDEX IF NOT EXISTS events_channel ON events(channel_id, seq);
+CREATE INDEX IF NOT EXISTS events_message ON events(message_id);
+"""
+
+
+def db_connect():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(STATE_DIR, 0o700)
+    fresh = not DB.exists()
+    con = sqlite3.connect(DB, timeout=15, isolation_level=None)
+    if fresh:
+        os.chmod(DB, 0o600)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA busy_timeout=15000")
+    con.executescript(SCHEMA)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def emoji_key(e):
+    return f"{e.get('name')}:{e['id']}" if e.get("id") else e.get("name") or "?"
+
+
+def extras_of(m):
+    ex = {}
+    if m.get("attachments"):
+        ex["attachments"] = [{"filename": a.get("filename"), "url": a.get("url")} for a in m["attachments"]]
+    if m.get("embeds"):
+        ex["embeds"] = [
+            {"title": e.get("title"), "url": e.get("url"), "description": (e.get("description") or "")[:300]}
+            for e in m["embeds"]
+        ]
+    snaps = [s.get("message") or {} for s in m.get("message_snapshots") or []]
+    if snaps:
+        ex["forwarded"] = [{"content": s.get("content", ""), "attachments": [a.get("url") for a in s.get("attachments", [])]} for s in snaps]
+    if m.get("sticker_items"):
+        ex["stickers"] = [s.get("name") for s in m["sticker_items"]]
+    if m.get("poll"):
+        p = m["poll"]
+        ex["poll"] = {
+            "question": (p.get("question") or {}).get("text"),
+            "answers": [(a.get("poll_media") or {}).get("text") for a in p.get("answers", [])],
+        }
+    return json.dumps(ex) if ex else None
+
+
+def safe_name(name):
+    name = re.sub(r"[\x00-\x1f\x7f/\\]", "_", name or "").strip().lstrip(".")
+    stem, ext = os.path.splitext(name)
+    return stem[:150] + ext[:20] or "file"
+
+
+def media_files(cid, mid, ex):
+    for f in ex.get("forwarded", []):
+        f["attachments"] = [a if isinstance(a, dict) else {"filename": None, "url": a} for a in f["attachments"]]
+    files = ex.get("attachments", []) + [a for f in ex.get("forwarded", []) for a in f["attachments"]]
+    named = []
+    for a in files:
+        a["path"] = None
+        if not a.get("url"):
+            continue
+        parts = urllib.parse.unquote(urllib.parse.urlsplit(a["url"]).path).split("/")
+        a["filename"] = a.get("filename") or parts[-1]
+        named.append((a, safe_name(a["filename"]), parts[-2] if len(parts) > 1 else ""))
+    names = [name for _, name, _ in named]
+    for a, name, attachment_id in named:
+        if names.count(name) > 1:
+            stem, ext = os.path.splitext(name)
+            name = safe_name(f"{stem}-{attachment_id}{ext}")
+        a["path"] = MEDIA / str(cid) / str(mid) / name
+    return [a for a, _, _ in named]
+
+
+def download(url, dest, user_agent):
+    u = urllib.parse.urlsplit(url)
+    if u.scheme != "https" or u.hostname not in MEDIA_HOSTS:
+        raise ValueError(f"not a Discord CDN link (host {u.hostname})")
+    for d in (MEDIA, dest.parent.parent, dest.parent):
+        d.mkdir(mode=0o700, exist_ok=True)
+    tmp = dest.with_name(f".{dest.name}.{os.getpid()}.part")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": user_agent})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "wb") as f:
+                shutil.copyfileobj(r, f)
+            want = r.headers.get("Content-Length")
+        size = tmp.stat().st_size
+        if want is not None and size != int(want):
+            raise OSError(f"incomplete download ({size} of {want} bytes)")
+        os.replace(tmp, dest)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return size
+
+
+class Recorder:
+    def __init__(self, con, channels):
+        self.con = con
+        self.channels = channels
+
+    def watched(self, cid):
+        return cid is not None and int(cid) in self.channels
+
+    def meta(self, **kv):
+        for k, v in kv.items():
+            self.con.execute("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)", (k, None if v is None else str(v)))
+
+    def user(self, u):
+        if not u or not u.get("id"):
+            return
+        self.con.execute(
+            "INSERT INTO users (id, username, global_name) VALUES (?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET username=excluded.username, global_name=excluded.global_name",
+            (int(u["id"]), u.get("username"), u.get("global_name")),
+        )
+
+    def channel(self, cid, name):
+        self.con.execute("INSERT OR REPLACE INTO channels (id, name) VALUES (?, ?)", (int(cid), name))
+
+    def event(self, cid, mid, kind, at, user_id=None, emoji=None, source="live"):
+        self.con.execute(
+            "INSERT INTO events (at, channel_id, message_id, kind, user_id, emoji, source) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (at or now_iso(), int(cid), int(mid), kind, user_id, emoji, source),
+        )
+        self.meta(last_event_at=now_iso())
+
+    def message(self, m, source="live", quiet=False):
+        if not self.watched(m.get("channel_id")):
+            return
+        cid, mid = int(m["channel_id"]), int(m["id"])
+        author = m.get("author") or {}
+        self.user(author)
+        for u in m.get("mentions") or []:
+            self.user(u)
+        ref = m.get("referenced_message")
+        if ref and str(ref.get("channel_id", m["channel_id"])) == str(m["channel_id"]):
+            ref.setdefault("channel_id", m["channel_id"])
+            self.message(ref, source, quiet=True)
+        reply_to = None
+        if m.get("type") == 19 and (m.get("message_reference") or {}).get("message_id"):
+            reply_to = int(m["message_reference"]["message_id"])
+        author_id = int(author["id"]) if author.get("id") else None
+        row = self.con.execute("SELECT content, edited_at FROM messages WHERE id=?", (mid,)).fetchone()
+        values = (cid, author_id, m.get("type"), m.get("content", ""), m.get("timestamp"), m.get("edited_timestamp"), reply_to, extras_of(m))
+        if row is None:
+            self.con.execute(
+                "INSERT INTO messages (channel_id, author_id, type, content, created_at, edited_at, reply_to, extras, id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (*values, mid),
+            )
+            if not quiet:
+                self.event(cid, mid, "message", m.get("timestamp"), author_id, source=source)
+            return
+        if quiet:
+            return
+        self.con.execute(
+            "UPDATE messages SET channel_id=?, author_id=?, type=?, content=?, created_at=?, edited_at=?, reply_to=?, extras=? WHERE id=?",
+            (*values, mid),
+        )
+        if m.get("content", "") != row["content"] or (m.get("edited_timestamp") and m.get("edited_timestamp") != row["edited_at"]):
+            self.event(cid, mid, "edit", m.get("edited_timestamp"), author_id, source=source)
+
+    def update(self, m):
+        if not self.watched(m.get("channel_id")):
+            return
+        mid = int(m["id"])
+        row = self.con.execute("SELECT content, edited_at FROM messages WHERE id=?", (mid,)).fetchone()
+        if row is None:
+            if m.get("author"):
+                self.message(m, quiet=True)
+                self.event(int(m["channel_id"]), mid, "edit", m.get("edited_timestamp"), int(m["author"]["id"]))
+            return
+        if "embeds" in m or "attachments" in m:
+            self.con.execute("UPDATE messages SET extras=? WHERE id=?", (extras_of(m), mid))
+        changed = "content" in m and m["content"] != row["content"]
+        if changed or (m.get("edited_timestamp") and m["edited_timestamp"] != row["edited_at"]):
+            self.con.execute(
+                "UPDATE messages SET content=COALESCE(?, content), edited_at=COALESCE(?, edited_at) WHERE id=?",
+                (m.get("content"), m.get("edited_timestamp"), mid),
+            )
+            author = self.con.execute("SELECT author_id FROM messages WHERE id=?", (mid,)).fetchone()[0]
+            self.event(int(m["channel_id"]), mid, "edit", m.get("edited_timestamp"), author)
+
+    def delete(self, cid, mid, source="live"):
+        if not self.watched(cid):
+            return
+        row = self.con.execute("SELECT author_id FROM messages WHERE id=? AND deleted=0", (int(mid),)).fetchone()
+        if row is None:
+            return
+        self.con.execute("UPDATE messages SET deleted=1 WHERE id=?", (int(mid),))
+        self.event(cid, mid, "delete", now_iso(), row["author_id"], source=source)
+
+    def react_add(self, cid, mid, emoji, uid, source="live"):
+        if not self.watched(cid):
+            return
+        cur = self.con.execute(
+            "INSERT OR IGNORE INTO reactions (message_id, emoji, user_id, at) VALUES (?, ?, ?, ?)",
+            (int(mid), emoji, int(uid), now_iso()),
+        )
+        if cur.rowcount:
+            self.event(cid, mid, "react", now_iso(), int(uid), emoji, source)
+
+    def react_remove(self, cid, mid, emoji, uid, source="live"):
+        if not self.watched(cid):
+            return
+        cur = self.con.execute(
+            "DELETE FROM reactions WHERE message_id=? AND emoji=? AND user_id=?", (int(mid), emoji, int(uid))
+        )
+        if cur.rowcount:
+            self.event(cid, mid, "unreact", now_iso(), int(uid), emoji, source)
+
+    def react_clear(self, cid, mid, emoji=None):
+        if not self.watched(cid):
+            return
+        rows = self.con.execute(
+            "SELECT emoji, user_id FROM reactions WHERE message_id=? AND (? IS NULL OR emoji=?)", (int(mid), emoji, emoji)
+        ).fetchall()
+        for r in rows:
+            self.react_remove(cid, mid, r["emoji"], r["user_id"])
+
+    def stored_reactions(self, mid):
+        out = {}
+        for r in self.con.execute("SELECT emoji, user_id FROM reactions WHERE message_id=?", (int(mid),)):
+            out.setdefault(r["emoji"], set()).add(r["user_id"])
+        return out
+
+
+class Listener:
+    def __init__(self, auth, rec):
+        self.token = auth["token"]
+        h = auth.get("headers", {})
+        self.user_agent = h.get("user-agent", "Mozilla/5.0")
+        self.super_b64 = h.get("x-super-properties")
+        props = json.loads(base64.b64decode(self.super_b64)) if self.super_b64 else {"os": "Linux", "browser": "Chrome", "device": ""}
+        for k in ("client_heartbeat_session_id", "client_app_state"):
+            props.pop(k, None)
+        self.properties = props
+        self.rest_headers = {
+            "Authorization": self.token,
+            "User-Agent": self.user_agent,
+            "Referer": "https://discord.com/channels/@me",
+            "X-Discord-Locale": h.get("x-discord-locale", "en-US"),
+            "X-Discord-Timezone": h.get("x-discord-timezone", "UTC"),
+        }
+        if self.super_b64:
+            self.rest_headers["X-Super-Properties"] = self.super_b64
+        self.rec = rec
+        self.session_id = None
+        self.resume_url = None
+        self.seq = None
+        self.acked = True
+        self.ready = False
+        self.tasks = set()
+        self.seen = {}
+        self.media_slots = asyncio.Semaphore(MEDIA_PARALLEL)
+        self.media_busy = set()
+        self.media_gone = set()
+
+    def identify(self):
+        return {
+            "token": self.token,
+            "properties": self.properties,
+            "presence": {"status": "unknown", "since": 0, "activities": [], "afk": True},
+            "compress": False,
+            "client_state": {"guild_versions": {}},
+        }
+
+    async def send(self, ws, op, d):
+        if op not in ALLOWED_OPS:
+            raise RuntimeError(f"gateway op {op} is not allowed: this listener is read-only")
+        await ws.send(json.dumps({"op": op, "d": d}))
+
+    def http_get(self, path):
+        req = urllib.request.Request(API + path, headers=self.rest_headers, method="GET")
+        for _ in range(6):
+            try:
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    return json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    body = json.loads(e.read() or b"{}")
+                    time.sleep(float(body.get("retry_after", 2)) + 0.5)
+                    continue
+                if e.code == 401:
+                    raise AuthError("REST 401") from None
+                raise RuntimeError(f"GET {path.split('?')[0]}: HTTP {e.code}") from None
+        raise RuntimeError(f"GET {path.split('?')[0]}: still rate limited")
+
+    async def get(self, path):
+        out = await asyncio.to_thread(self.http_get, path)
+        await asyncio.sleep(0.4)
+        return out
+
+    def spawn(self, coro):
+        t = asyncio.create_task(coro)
+        self.tasks.add(t)
+        t.add_done_callback(self.tasks.discard)
+
+    async def backfill(self):
+        for cid in self.rec.channels:
+            try:
+                n = await self.backfill_channel(cid)
+                log(f"backfill {cid}: {n} messages checked")
+            except AuthError:
+                log("backfill: the token was refused")
+                return
+            except Exception as e:
+                log(f"backfill {cid} failed: {e}")
+        self.rec.meta(backfill_at=now_iso())
+        await self.backfill_media()
+
+    async def backfill_media(self):
+        got = failed = 0
+        rows = self.rec.con.execute(
+            "SELECT id, channel_id FROM messages WHERE extras LIKE '%\"attachments\"%' ORDER BY id"
+        ).fetchall()
+        for r in rows:
+            if not self.rec.watched(r["channel_id"]):
+                continue
+            try:
+                g, f = await self.fetch_media(r["id"])
+            except AuthError:
+                log("media backfill: the token was refused")
+                return
+            except Exception as e:
+                log(f"media backfill {r['id']} failed: {type(e).__name__}: {e}")
+                continue
+            got, failed = got + g, failed + f
+        log(f"media backfill: {got} files downloaded, {failed} could not be downloaded")
+
+    async def fetch_media(self, mid, refresh=True):
+        mid = int(mid)
+        con = self.rec.con
+        row = con.execute("SELECT channel_id, extras, deleted FROM messages WHERE id=?", (mid,)).fetchone()
+        if row is None or not row["extras"]:
+            return 0, 0
+        cid = row["channel_id"]
+        todo = [
+            f for f in media_files(cid, mid, json.loads(row["extras"]))
+            if f["path"] not in self.media_busy and not f["path"].exists()
+        ]
+        if not todo or mid in self.media_gone:
+            return 0, len(todo)
+        can_refresh = refresh and not row["deleted"]
+        got = failed = 0
+        expired = False
+        paths = {f["path"] for f in todo}
+        self.media_busy.update(paths)
+        try:
+            for f in todo:
+                dest = f["path"]
+                try:
+                    async with self.media_slots:
+                        size = await asyncio.to_thread(download, f["url"], dest, self.user_agent)
+                    got += 1
+                    log(f"media saved {cid}/{mid}/{dest.name} ({size} bytes)")
+                except Exception as e:
+                    failed += 1
+                    if isinstance(e, urllib.error.HTTPError) and e.code in (403, 404):
+                        expired = True
+                        if can_refresh:
+                            continue
+                    log(f"media {cid}/{mid}/{dest.name} failed: {type(e).__name__}: {e}")
+        finally:
+            self.media_busy.difference_update(paths)
+        if not expired:
+            return got, failed
+        if can_refresh:
+            page = await self.get(f"/channels/{cid}/messages?around={mid}&limit=1")
+            fresh = next((m for m in page if int(m["id"]) == mid), None)
+            if fresh is not None:
+                con.execute("UPDATE messages SET extras=? WHERE id=?", (extras_of(fresh), mid))
+                again, failed = await self.fetch_media(mid, refresh=False)
+                return got + again, failed
+            log(f"media {cid}/{mid}: Discord does not return the message; {failed} files not downloaded")
+        self.media_gone.add(mid)
+        return got, failed
+
+    async def media(self, mid):
+        try:
+            await self.fetch_media(mid)
+        except Exception as e:
+            log(f"media {mid} failed: {type(e).__name__}: {e}")
+
+    def spawn_media(self, d):
+        for mid in (d.get("id"), (d.get("referenced_message") or {}).get("id")):
+            if mid:
+                self.spawn(self.media(mid))
+
+    async def backfill_channel(self, cid):
+        con = self.rec.con
+        latest = con.execute("SELECT max(id) FROM messages WHERE channel_id=? AND deleted=0", (cid,)).fetchone()[0]
+        batch = await self.get(f"/channels/{cid}/messages?limit=100")
+        msgs = list(batch)
+        pages = 1
+        while latest and len(batch) == 100 and min(int(m["id"]) for m in batch) > latest and pages < 10:
+            batch = await self.get(f"/channels/{cid}/messages?limit=100&before={min(int(m['id']) for m in batch)}")
+            msgs += batch
+            pages += 1
+        msgs.sort(key=lambda m: int(m["id"]))
+        for m in msgs:
+            m.setdefault("channel_id", str(cid))
+            self.rec.message(m, "backfill")
+            await self.sync_reactions(cid, m)
+        if msgs:
+            seen = {int(m["id"]) for m in msgs}
+            lo, hi = int(msgs[0]["id"]), int(msgs[-1]["id"])
+            for (mid,) in con.execute(
+                "SELECT id FROM messages WHERE channel_id=? AND id BETWEEN ? AND ? AND deleted=0", (cid, lo, hi)
+            ).fetchall():
+                if mid not in seen:
+                    self.rec.delete(cid, mid, "backfill")
+        return len(msgs)
+
+    async def sync_reactions(self, cid, m):
+        api = {}
+        for r in m.get("reactions") or []:
+            cd = r.get("count_details") or {}
+            api[emoji_key(r["emoji"])] = (r["emoji"], cd.get("normal", r.get("count", 0)), cd.get("burst", 0))
+        stored = self.rec.stored_reactions(m["id"])
+        for key in set(stored) - set(api):
+            for uid in stored[key]:
+                self.rec.react_remove(cid, m["id"], key, uid, "backfill")
+        for key, (emoji, normal, burst) in api.items():
+            have = stored.get(key, set())
+            if normal + burst == len(have):
+                continue
+            users = set()
+            for kind, count in ((0, normal), (1, burst)):
+                if count:
+                    users |= await self.reactors(cid, m["id"], key, kind)
+            for uid in users - have:
+                self.rec.react_add(cid, m["id"], key, uid, "backfill")
+            for uid in have - users:
+                self.rec.react_remove(cid, m["id"], key, uid, "backfill")
+
+    async def reactors(self, cid, mid, key, kind):
+        users, after = set(), None
+        while True:
+            q = f"?limit=100&type={kind}" + (f"&after={after}" if after else "")
+            page = await self.get(f"/channels/{cid}/messages/{mid}/reactions/{urllib.parse.quote(key)}{q}")
+            for u in page:
+                self.rec.user(u)
+                users.add(int(u["id"]))
+            if len(page) < 100:
+                return users
+            after = page[-1]["id"]
+
+    def on_ready(self, d):
+        self.session_id = d["session_id"]
+        self.resume_url = d.get("resume_gateway_url")
+        me = d["user"]
+        self.rec.user(me)
+        users = {u["id"]: u for u in d.get("users", [])}
+        for c in d.get("private_channels", []):
+            if not self.rec.watched(c.get("id")):
+                continue
+            recips = c.get("recipients") or [users[i] for i in c.get("recipient_ids", []) if i in users]
+            for u in recips:
+                self.rec.user(u)
+        self.rec.meta(
+            state="ready", ready_at=now_iso(), self_id=me["id"],
+            self_name=me.get("global_name") or me.get("username"), heartbeat_ack_at=now_iso(),
+        )
+        log(f"ready as {me.get('username')}; recording {len(self.rec.channels)} chats")
+        self.on_sessions(d.get("sessions") or [])
+        self.spawn(self.backfill())
+
+    def on_sessions(self, sessions):
+        overall = next((x for x in sessions if x.get("session_id") == "all"), None)
+        mine = next((x for x in sessions if x.get("session_id") == self.session_id), None)
+        self.rec.meta(
+            presence_all=overall.get("status") if overall else None,
+            presence_session=mine.get("status") if mine else None,
+            sessions=len([x for x in sessions if x.get("session_id") != "all"]),
+        )
+
+    def dispatch(self, t, d):
+        rec = self.rec
+        self.seen[t] = self.seen.get(t, 0) + 1
+        if t == "READY":
+            self.ready = True
+            self.on_ready(d)
+        elif t == "RESUMED":
+            self.ready = True
+            rec.meta(state="ready", resumed_at=now_iso(), heartbeat_ack_at=now_iso())
+            log("resumed")
+        elif t == "SESSIONS_REPLACE" and isinstance(d, list):
+            self.on_sessions(d)
+        elif not isinstance(d, dict) or not rec.watched(d.get("channel_id")):
+            return
+        elif t == "MESSAGE_CREATE":
+            rec.message(d)
+            self.spawn_media(d)
+        elif t == "MESSAGE_UPDATE":
+            rec.update(d)
+            self.spawn_media(d)
+        elif t == "MESSAGE_DELETE":
+            rec.delete(d["channel_id"], d["id"])
+        elif t == "MESSAGE_DELETE_BULK":
+            for mid in d.get("ids", []):
+                rec.delete(d["channel_id"], mid)
+        elif t == "MESSAGE_REACTION_ADD":
+            rec.user((d.get("member") or {}).get("user"))
+            rec.react_add(d["channel_id"], d["message_id"], emoji_key(d["emoji"]), d["user_id"])
+        elif t == "MESSAGE_REACTION_ADD_MANY":
+            for r in d.get("reactions", []):
+                for uid in r.get("users", []):
+                    rec.react_add(d["channel_id"], d["message_id"], emoji_key(r["emoji"]), uid)
+        elif t == "MESSAGE_REACTION_REMOVE":
+            rec.react_remove(d["channel_id"], d["message_id"], emoji_key(d["emoji"]), d["user_id"])
+        elif t == "MESSAGE_REACTION_REMOVE_ALL":
+            rec.react_clear(d["channel_id"], d["message_id"])
+        elif t == "MESSAGE_REACTION_REMOVE_EMOJI":
+            rec.react_clear(d["channel_id"], d["message_id"], emoji_key(d["emoji"]))
+        elif t == "CHANNEL_RECIPIENT_ADD":
+            rec.user(d.get("user"))
+
+    async def heartbeat(self, ws, interval):
+        self.acked = True
+        await asyncio.sleep(interval * random.random())
+        while True:
+            if not self.acked:
+                log("no heartbeat ack; reconnecting")
+                await ws.close(4000)
+                return
+            self.acked = False
+            await self.send(ws, 1, self.seq)
+            await asyncio.sleep(interval)
+
+    async def connect_once(self):
+        from websockets.asyncio.client import connect
+        from websockets.exceptions import ConnectionClosed
+
+        resuming = bool(self.session_id and self.resume_url and self.seq is not None)
+        url = self.resume_url.rstrip("/") + GATEWAY_QUERY if resuming else GATEWAY
+        self.ready = False
+        inflator, buf, hb = zlib.decompressobj(), bytearray(), None
+        async with connect(
+            url, max_size=None, compression=None, ping_interval=None, open_timeout=20, close_timeout=5,
+            user_agent_header=self.user_agent, origin="https://discord.com",
+        ) as ws:
+            try:
+                async for raw in ws:
+                    if isinstance(raw, bytes):
+                        buf += raw
+                        if raw[-4:] != b"\x00\x00\xff\xff":
+                            continue
+                        raw = inflator.decompress(bytes(buf))
+                        buf.clear()
+                    p = json.loads(raw)
+                    op = p.get("op")
+                    if p.get("s") is not None:
+                        self.seq = p["s"]
+                    if op == 0:
+                        self.dispatch(p.get("t"), p.get("d"))
+                    elif op == 10:
+                        hb = asyncio.create_task(self.heartbeat(ws, p["d"]["heartbeat_interval"] / 1000))
+                        if resuming:
+                            await self.send(ws, 6, {"token": self.token, "session_id": self.session_id, "seq": self.seq})
+                        else:
+                            await self.send(ws, 2, self.identify())
+                    elif op == 11:
+                        self.acked = True
+                        self.rec.meta(heartbeat_ack_at=now_iso(), gateway_events=json.dumps(self.seen, sort_keys=True))
+                    elif op == 1:
+                        await self.send(ws, 1, self.seq)
+                    elif op == 7:
+                        log("gateway asked for a reconnect")
+                        await ws.close(4000)
+                    elif op == 9:
+                        log(f"session invalid (resumable={bool(p.get('d'))})")
+                        if not p.get("d"):
+                            self.session_id = self.seq = None
+                        await asyncio.sleep(random.uniform(1, 5))
+                        await ws.close(4000)
+            except ConnectionClosed:
+                pass
+            finally:
+                if hb:
+                    hb.cancel()
+        return ws.close_code
+
+    async def run(self):
+        failures = 0
+        while True:
+            code = None
+            try:
+                code = await self.connect_once()
+                log(f"connection closed (code {code})")
+            except Exception as e:
+                log(f"connection error: {type(e).__name__}: {e}")
+            if code == 4004:
+                raise AuthError("gateway 4004")
+            if code in (4007, 4009) or (code and 4010 <= code <= 4014):
+                self.session_id = self.seq = None
+            failures = 0 if self.ready else failures + 1
+            delay = 60 if code == 4008 else min(60, 2 ** failures) + random.random()
+            self.rec.meta(state="reconnecting")
+            await asyncio.sleep(delay)
+
+
+def cmd_daemon(args):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("another discord-gw daemon is running", file=sys.stderr)
+        return 1
+    if not AUTH.exists():
+        print("no token yet. Run: discord-gw login", file=sys.stderr)
+        return EXIT_AUTH
+    for stale in MEDIA.glob("*/*/.*.part"):
+        stale.unlink(missing_ok=True)
+    con = db_connect()
+    rec = Recorder(con, load_channels())
+    for cid, name in rec.channels.items():
+        con.execute("INSERT OR IGNORE INTO channels (id, name) VALUES (?, ?)", (cid, name))
+    rec.meta(state="starting", pid=os.getpid(), started_at=now_iso())
+    try:
+        asyncio.run(serve(Listener(json.loads(AUTH.read_text()), rec)))
+    except AuthError as e:
+        rec.meta(state="auth_failed", auth_failed_at=now_iso())
+        log(f"the token was refused ({e}). Run: discord-gw login")
+        return EXIT_AUTH
+    rec.meta(state="stopped", stopped_at=now_iso())
+    log("stopped")
+    return 0
+
+
+async def serve(listener):
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, task.cancel)
+    try:
+        await listener.run()
+    except asyncio.CancelledError:
+        for t in list(listener.tasks):
+            t.cancel()
+
+
+class View:
+    def __init__(self, con):
+        self.con = con
+        self.users = {r["id"]: r["global_name"] or r["username"] for r in con.execute("SELECT * FROM users")}
+        self.meta = {r["k"]: r["v"] for r in con.execute("SELECT * FROM meta")}
+        self.self_id = int(self.meta["self_id"]) if self.meta.get("self_id") else None
+        self.channel_names = {r["id"]: r["name"] for r in con.execute("SELECT * FROM channels")}
+
+    def name(self, uid):
+        if uid is None:
+            return "?"
+        n = self.users.get(uid, str(uid))
+        return f"{n} (self)" if uid == self.self_id else n
+
+    def alive(self):
+        ack = self.meta.get("heartbeat_ack_at")
+        if not ack or self.meta.get("state") in ("auth_failed", "stopped"):
+            return False
+        pid = self.meta.get("pid") or ""
+        if not pid.isdigit() or int(pid) <= 1:
+            return False
+        try:
+            os.kill(int(pid), 0)
+        except OSError:
+            return False
+        return (datetime.now(timezone.utc) - datetime.fromisoformat(ack)).total_seconds() < ALIVE_SECS
+
+    def channel(self, value):
+        if not value:
+            default = json.loads(CONFIG.read_text()).get("default_channel") if CONFIG.exists() else None
+            if not default:
+                raise SystemExit(f"no chat given and no default_channel in {CONFIG}; use --channel")
+            return int(default)
+        if value.isdigit():
+            return int(value)
+        hits = [cid for cid, n in self.channel_names.items() if value.lower() in (n or "").lower()]
+        if len(hits) != 1:
+            raise SystemExit(f"chat {value!r} matches {len(hits)} recorded chats; use the id (discord-gw status)")
+        return hits[0]
+
+    def when(self, iso):
+        if not iso:
+            return "?"
+        t = datetime.fromisoformat(iso).astimezone()
+        return t.strftime("%H:%M:%S") if t.date() == datetime.now().date() else t.strftime("%m-%d %H:%M")
+
+    def text(self, s):
+        s = re.sub(r"<@!?(\d+)>", lambda m: "@" + self.users.get(int(m.group(1)), m.group(1)), s or "")
+        s = re.sub(r"<#(\d+)>", lambda m: "#" + (self.channel_names.get(int(m.group(1))) or m.group(1)), s)
+        s = re.sub(r"<a?:(\w+):\d+>", r":\1:", s)
+        return re.sub(r"<t:(\d+)(?::\w)?>", lambda m: datetime.fromtimestamp(int(m.group(1))).strftime("%m-%d %H:%M"), s)
+
+    def emoji(self, key):
+        return f":{key.split(':')[0]}:" if ":" in key else key
+
+    def msg(self, mid):
+        return self.con.execute("SELECT * FROM messages WHERE id=?", (mid,)).fetchone()
+
+    def preview(self, row, width=70):
+        if row is None:
+            return "(not recorded)"
+        t = " ".join(self.text(row["content"]).split()) or "(no text)"
+        t = t if len(t) <= width else t[: width - 1] + "…"
+        return f'{self.name(row["author_id"])}: "{t}"'
+
+    def reactions(self, mid):
+        out = {}
+        for r in self.con.execute("SELECT emoji, user_id FROM reactions WHERE message_id=? ORDER BY at", (mid,)):
+            out.setdefault(self.emoji(r["emoji"]), []).append(self.name(r["user_id"]))
+        return out
+
+    def link(self, row):
+        return f"https://discord.com/channels/@me/{row['channel_id']}/{row['id']}"
+
+    def extras(self, row):
+        ex = json.loads(row["extras"]) if row["extras"] else {}
+        for f in media_files(row["channel_id"], row["id"], ex):
+            f["path"] = str(f["path"]) if f["path"].exists() else None
+        return ex
+
+    def clip(self, a):
+        return "  📎 " + " ".join(x for x in (a.get("filename"), a.get("path"), a.get("url")) if x)
+
+    def as_json(self, row):
+        reply = self.msg(row["reply_to"]) if row["reply_to"] else None
+        return {
+            "id": str(row["id"]), "channel_id": str(row["channel_id"]), "link": self.link(row),
+            "author": self.users.get(row["author_id"]), "author_id": str(row["author_id"]),
+            "self": row["author_id"] == self.self_id, "created_at": row["created_at"], "edited_at": row["edited_at"],
+            "deleted": bool(row["deleted"]), "content": self.text(row["content"]),
+            "reply_to": str(row["reply_to"]) if row["reply_to"] else None,
+            "reply_to_preview": self.preview(reply) if row["reply_to"] else None,
+            "extras": self.extras(row), "reactions": self.reactions(row["id"]),
+        }
+
+    def block(self, row, indent=""):
+        head = f"{self.when(row['created_at'])}  {self.name(row['author_id'])}  [msg {row['id']}]"
+        if row["deleted"]:
+            head += "  (deleted)"
+        if row["type"] not in (0, 19, None):
+            head += f"  (system type {row['type']})"
+        lines = [head]
+        if row["reply_to"]:
+            lines.append(f"  ↳ reply to [msg {row['reply_to']}] {self.preview(self.msg(row['reply_to']))}")
+        for ln in self.text(row["content"]).splitlines() or ([] if row["extras"] else ["(no text)"]):
+            lines.append("    " + ln)
+        ex = self.extras(row)
+        lines += [self.clip(a) for a in ex.get("attachments", [])]
+        for e in ex.get("embeds", []):
+            if e.get("title") or e.get("url"):
+                lines.append(f"  🔗 {e.get('title') or ''} {e.get('url') or ''}".rstrip())
+        for f in ex.get("forwarded", []):
+            lines.append(f"  ↪ forwarded: {' '.join(f['content'].split())[:300]}")
+            lines += [self.clip(a) for a in f["attachments"]]
+        if ex.get("stickers"):
+            lines.append(f"  sticker: {', '.join(ex['stickers'])}")
+        if ex.get("poll"):
+            lines.append(f"  poll: {ex['poll']['question']} [{' / '.join(map(str, ex['poll']['answers']))}]")
+        if row["edited_at"]:
+            lines.append(f"  ✎ edited {self.when(row['edited_at'])}")
+        reacts = self.reactions(row["id"])
+        if reacts:
+            lines.append("  reactions: " + " · ".join(f"{e} {', '.join(who)}" for e, who in reacts.items()))
+        return "\n".join(indent + ln for ln in lines)
+
+    def max_seq(self, cid):
+        return self.con.execute("SELECT COALESCE(max(seq), 0) FROM events WHERE channel_id=?", (cid,)).fetchone()[0]
+
+
+def warn_if_down(view):
+    if view.alive():
+        return
+    state = view.meta.get("state", "never started")
+    print(f"warning: the listener is not running (state: {state}); the data can be old. Run: discord-gw status", file=sys.stderr)
+
+
+def start_service():
+    subprocess.run(["systemctl", "--user", "start", SERVICE], check=False)
+
+
+def ensure_alive(con, wait_secs=60):
+    view = View(con)
+    if view.alive():
+        return True
+    if view.meta.get("state") == "auth_failed":
+        print("the listener stopped: Discord refused the token. Run: discord-gw login", file=sys.stderr)
+        return False
+    start_service()
+    deadline = time.time() + wait_secs
+    while time.time() < deadline:
+        time.sleep(2)
+        if View(con).alive():
+            return True
+    print("the listener did not start. Check: journalctl --user -u discord-gw -n 50", file=sys.stderr)
+    return False
+
+
+def cmd_status(args):
+    con = db_connect()
+    v = View(con)
+    m = v.meta
+    ack = m.get("heartbeat_ack_at")
+    age = f"{int((datetime.now(timezone.utc) - datetime.fromisoformat(ack)).total_seconds())}s ago" if ack else "never"
+    print(f"listener: {'running' if v.alive() else 'DOWN'} (state {m.get('state', 'never started')}, last heartbeat ack {age})")
+    if m.get("self_name"):
+        print(f"account: {m['self_name']} · connected {v.when(m.get('ready_at'))} · backfill {v.when(m.get('backfill_at'))}")
+        print(f"presence of this listener: {m.get('presence_session') or '?'} (it takes the account setting; {m.get('sessions') or '?'} sessions open)")
+        seen = json.loads(m.get("gateway_events") or "{}")
+        if seen:
+            print(f"gateway events since connect: {sum(seen.values())} ({', '.join(f'{k} {v}' for k, v in sorted(seen.items(), key=lambda kv: -kv[1])[:8])})")
+    print("chats:")
+    for cid, name in sorted(v.channel_names.items()):
+        n, last = con.execute(
+            "SELECT count(*), max(id) FROM messages WHERE channel_id=? AND deleted=0", (cid,)
+        ).fetchone()
+        tail = f", last {v.preview(v.msg(last), 50)} at {v.when(v.msg(last)['created_at'])}" if last else ""
+        print(f"  {cid}  {name}: {n} messages, cursor {v.max_seq(cid)}{tail}")
+    files = [
+        f for r in con.execute("SELECT id, channel_id, extras FROM messages WHERE extras LIKE '%\"attachments\"%'")
+        for f in media_files(r["channel_id"], r["id"], json.loads(r["extras"]))
+    ]
+    saved = sum(f["path"].exists() for f in files)
+    print(f"media: {saved} of {len(files)} attachments saved in {MEDIA}/<chat id>/<message id>/")
+    print(f"service: systemctl --user status {SERVICE} · logs: journalctl --user -u discord-gw -n 50")
+    return 0 if v.alive() else 1
+
+
+def cmd_read(args):
+    con = db_connect()
+    v = View(con)
+    warn_if_down(v)
+    cid = v.channel(args.channel)
+    if args.since_msg:
+        rows = con.execute("SELECT * FROM messages WHERE channel_id=? AND id>=? ORDER BY id", (cid, args.since_msg)).fetchall()
+    elif args.around:
+        before = con.execute(
+            "SELECT * FROM messages WHERE channel_id=? AND id<? ORDER BY id DESC LIMIT ?", (cid, args.around, args.last)
+        ).fetchall()
+        after = con.execute(
+            "SELECT * FROM messages WHERE channel_id=? AND id>=? ORDER BY id LIMIT ?", (cid, args.around, args.last + 1)
+        ).fetchall()
+        rows = list(reversed(before)) + list(after)
+    else:
+        rows = list(reversed(con.execute(
+            "SELECT * FROM messages WHERE channel_id=? ORDER BY id DESC LIMIT ?", (cid, args.last)
+        ).fetchall()))
+    if args.json:
+        for r in rows:
+            print(json.dumps(v.as_json(r), ensure_ascii=False))
+        print(json.dumps({"cursor": v.max_seq(cid)}))
+        return 0
+    print(f"{v.channel_names.get(cid, cid)}: {len(rows)} messages\n")
+    for r in rows:
+        print(v.block(r))
+    print(f"\ncursor {v.max_seq(cid)} · wait for more: discord-gw wait --cursor {v.max_seq(cid)}")
+    return 0
+
+
+def cursor_for_message(con, cid, mid):
+    seq = con.execute("SELECT min(seq) FROM events WHERE message_id=? AND kind='message'", (mid,)).fetchone()[0]
+    if seq is not None:
+        return seq
+    later = con.execute(
+        "SELECT min(seq) FROM events WHERE channel_id=? AND kind='message' AND message_id>?", (cid, mid)
+    ).fetchone()[0]
+    if later is not None:
+        return later - 1
+    return con.execute("SELECT COALESCE(max(seq), 0) FROM events WHERE channel_id=?", (cid,)).fetchone()[0]
+
+
+def event_line(v, e):
+    who = v.name(e["user_id"])
+    target = v.msg(e["message_id"])
+    at = v.when(e["at"])
+    kind = e["kind"]
+    if kind == "message" and target is not None:
+        return v.block(target)
+    if kind in ("react", "unreact"):
+        verb = "reacted" if kind == "react" else "removed reaction"
+        seen = "  (found by the backfill; the time is when it was found)" if e["source"] == "backfill" else ""
+        return f"{at}  {who}  {verb} {v.emoji(e['emoji'])} on [msg {e['message_id']}] {v.preview(target)}{seen}"
+    if kind == "edit" and target is not None:
+        body = "\n".join("    " + ln for ln in v.text(target["content"]).splitlines())
+        return f"{at}  {who}  edited [msg {e['message_id']}]\n{body}"
+    if kind == "delete":
+        return f"{at}  deleted [msg {e['message_id']}] {v.preview(target)}"
+    return f"{at}  {who}  {kind} [msg {e['message_id']}]"
+
+
+def event_json(v, e):
+    target = v.msg(e["message_id"])
+    return {
+        "seq": e["seq"], "kind": e["kind"], "at": e["at"], "user": v.users.get(e["user_id"]),
+        "user_id": str(e["user_id"]) if e["user_id"] else None, "self": e["user_id"] == v.self_id,
+        "emoji": v.emoji(e["emoji"]) if e["emoji"] else None, "source": e["source"],
+        "message": v.as_json(target) if target is not None else {"id": str(e["message_id"])},
+    }
+
+
+def pending(con, cid, cursor, others, self_id):
+    rows = con.execute("SELECT * FROM events WHERE channel_id=? AND seq>? ORDER BY seq", (cid, cursor)).fetchall()
+    top = rows[-1]["seq"] if rows else cursor
+    if others:
+        rows = [r for r in rows if r["user_id"] is None or r["user_id"] != self_id]
+    return rows, top
+
+
+def cmd_wait(args):
+    con = db_connect()
+    v = View(con)
+    cid = v.channel(args.channel)
+    if args.cursor is not None:
+        cursor = args.cursor
+    elif args.since_msg:
+        cursor = cursor_for_message(con, cid, args.since_msg)
+    else:
+        cursor = v.max_seq(cid)
+    if not ensure_alive(con):
+        return EXIT_DOWN
+    deadline = time.time() + args.timeout
+    next_check = time.time() + 30
+    while True:
+        rows, top = pending(con, cid, cursor, args.others, v.self_id)
+        if rows:
+            time.sleep(min(args.batch, max(0, deadline - time.time())))
+            break
+        cursor = top
+        if time.time() >= deadline:
+            if args.json:
+                print(json.dumps({"events": [], "cursor": cursor, "timeout": True}))
+            else:
+                print(f"no new events in {v.channel_names.get(cid, cid)} for {args.timeout / 60:g} min. cursor {cursor}")
+                print(f"next: discord-gw wait --cursor {cursor}")
+            return EXIT_TIMEOUT
+        if time.time() >= next_check:
+            next_check = time.time() + 30
+            if not View(con).alive() and not ensure_alive(con):
+                return EXIT_DOWN
+        time.sleep(1)
+    v = View(con)
+    rows, top = pending(con, cid, cursor, args.others, v.self_id)
+    if args.json:
+        print(json.dumps({"events": [event_json(v, e) for e in rows], "cursor": top}, ensure_ascii=False))
+        return 0
+    print(f"{len(rows)} new events in {v.channel_names.get(cid, cid)} (cursor {top}):\n")
+    for e in rows:
+        print(event_line(v, e))
+    print(f"\nnext: discord-gw wait --cursor {top}")
+    return 0
+
+
+def cmd_thread(args):
+    con = db_connect()
+    v = View(con)
+    warn_if_down(v)
+    root = v.msg(args.msg_id)
+    if root is None:
+        print(f"message {args.msg_id} is not recorded. Try: discord-gw read --around {args.msg_id}", file=sys.stderr)
+        return 1
+    print(v.block(root))
+    seen = {root["id"]}
+
+    def walk(mid, depth):
+        for r in con.execute("SELECT * FROM messages WHERE reply_to=? ORDER BY id", (mid,)).fetchall():
+            if r["id"] in seen:
+                continue
+            seen.add(r["id"])
+            print(v.block(r, "    " * depth))
+            walk(r["id"], depth + 1)
+
+    walk(root["id"], 1)
+    rest = con.execute(
+        "SELECT count(*) FROM messages WHERE channel_id=? AND id>? AND deleted=0", (root["channel_id"], root["id"])
+    ).fetchone()[0] - (len(seen) - 1)
+    print(f"\n{len(seen) - 1} replies. {rest} other messages came after it: discord-gw read --since-msg {root['id']}")
+    return 0
+
+
+def cmd_media(args):
+    row = View(db_connect()).msg(args.msg_id)
+    if row is None:
+        print(f"message {args.msg_id} is not recorded. Try: discord-gw read --around {args.msg_id}", file=sys.stderr)
+        return 1
+    files = media_files(row["channel_id"], row["id"], json.loads(row["extras"] or "{}"))
+    if not files:
+        print(f"message {args.msg_id} has no attachments", file=sys.stderr)
+        return 1
+    missing = [f for f in files if not f["path"].exists()]
+    for f in files:
+        if f not in missing:
+            print(f["path"])
+    for f in missing:
+        print(f"not downloaded: {f['filename']} (logs: journalctl --user -u discord-gw | grep media)", file=sys.stderr)
+    return 1 if missing else 0
+
+
+LOGIN_SCRIPT = r"""
+import json, os, time
+tid = new_tab("about:blank")
+try:
+    cdp("Network.enable")
+    drain_events()
+    goto_url("https://discord.com/channels/@me")
+    wait_for_load()
+    found = None
+    deadline = time.time() + 30
+    while time.time() < deadline and not found:
+        time.sleep(1.5)
+        for ev in drain_events():
+            if ev.get("method") not in ("Network.requestWillBeSent", "Network.requestWillBeSentExtraInfo"):
+                continue
+            p = ev.get("params", {})
+            h = (p.get("request") or {}).get("headers") or p.get("headers") or {}
+            hl = {k.lower(): v for k, v in h.items()}
+            if hl.get("authorization") and hl.get("x-super-properties"):
+                found = hl
+                break
+finally:
+    close_tab(tid)
+if not found:
+    print("LOGIN-FAILED: no signed-in Discord request seen. Is Discord logged in in this browser?")
+else:
+    keep = {k: found[k] for k in ("x-super-properties", "user-agent", "x-discord-locale", "x-discord-timezone") if k in found}
+    path = AUTH_PATH
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"token": found["authorization"], "headers": keep, "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, f)
+    os.chmod(path, 0o600)
+    print("LOGIN-OK")
+"""
+
+
+def cmd_login(args):
+    env = dict(os.environ, BU_NAME="dgw-login", BH_TAB_MARKER="0")
+    script = LOGIN_SCRIPT.replace("AUTH_PATH\n", repr(str(AUTH)) + "\n", 1)
+    out = subprocess.run(["browser-harness"], input=script, text=True, capture_output=True, env=env, cwd=HOME)
+    subprocess.run(["browser-harness", "--reload"], env=env, cwd=HOME, capture_output=True)
+    if "LOGIN-OK" not in out.stdout:
+        print("login failed:", (out.stdout + out.stderr).strip()[-800:], file=sys.stderr)
+        return 1
+    con = db_connect()
+    Recorder(con, {}).meta(state="restarting")
+    subprocess.run(["systemctl", "--user", "restart", SERVICE], check=False)
+    print(f"saved a fresh token in {AUTH} (mode 600) and restarted {SERVICE}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="discord-gw", description=USAGE, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("daemon")
+    sub.add_parser("status")
+    sub.add_parser("login")
+    r = sub.add_parser("read")
+    r.add_argument("--channel")
+    g = r.add_mutually_exclusive_group()
+    g.add_argument("--since-msg", type=int, help="this message and every message after it")
+    g.add_argument("--around", type=int, help="--last messages before and after this message")
+    r.add_argument("--last", type=int, default=25)
+    r.add_argument("--json", action="store_true")
+    w = sub.add_parser("wait")
+    w.add_argument("--channel")
+    g = w.add_mutually_exclusive_group()
+    g.add_argument("--since-msg", type=int, help="events after this message (your question)")
+    g.add_argument("--cursor", type=int, help="events after this cursor (from the last read or wait)")
+    w.add_argument("--timeout", type=parse_duration, default=parse_duration("60m"))
+    w.add_argument("--batch", type=parse_duration, default=parse_duration("30s"), help="after the first event, wait this long for more")
+    w.add_argument("--others", action="store_true", help="skip the events of the account itself")
+    w.add_argument("--json", action="store_true")
+    t = sub.add_parser("thread")
+    t.add_argument("msg_id", type=int)
+    t.add_argument("--channel")
+    sub.add_parser("media").add_argument("msg_id", type=int)
+    args = ap.parse_args()
+    handlers = {
+        "daemon": cmd_daemon, "status": cmd_status, "login": cmd_login,
+        "read": cmd_read, "wait": cmd_wait, "thread": cmd_thread, "media": cmd_media,
+    }
+    sys.exit(handlers[args.cmd](args))
+
+
+if __name__ == "__main__":
+    main()

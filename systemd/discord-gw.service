@@ -1,0 +1,14 @@
+[Unit]
+Description=Read-only Discord gateway listener for agent questions (discord-gw)
+
+[Service]
+ExecStart=%h/.local/bin/discord-gw daemon
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=3
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
